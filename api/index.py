@@ -21,9 +21,17 @@ Kalshi requires auth for those too.
 import os
 import re
 import secrets
+import sys
 from functools import wraps
 
 from flask import Flask, jsonify, request, Response
+
+# Vercel's Python runtime doesn't always add this file's own directory to
+# sys.path, so a plain "from kalshi_client import ..." can fail with
+# ModuleNotFoundError even though the file sits right next to it. Force it
+# onto the path explicitly so the sibling-module import works regardless of
+# how the runtime invokes this file.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kalshi_client import KalshiClient
 
