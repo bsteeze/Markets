@@ -120,16 +120,23 @@ def looks_like_tennis(event: dict) -> bool:
 
 
 def extract_score(market: dict):
-    """See README: verify real field name via /debug/raw on first live run,
-    then swap this to read it directly instead of the regex fallback."""
-    candidates = [
-        market.get("live_score"),
-        market.get("period_scores"),
-        market.get("custom_strike"),
-    ]
-    for c in candidates:
-        if c:
-            return c
+    """
+    IMPORTANT: verified against a real live match payload (Pegula vs
+    Swiatek, WTA Cincinnati) — Kalshi's market data does NOT include a
+    live set/game score field. "custom_strike" only carries an internal
+    player ID (tennis_competitor), not a score.
+
+    This means the "close score vs skewed price" flag currently has no
+    real score data to work with from Kalshi alone — it will only ever
+    fire via the regex fallback below (which won't match anything
+    meaningful, since there's no score text in the payload either).
+
+    To make the flag logic actually work as designed, you'd need a
+    second data source for live score (e.g. a sports-data API) and
+    cross-reference it with this market's event title / player names.
+    Keeping this function as a no-op placeholder for now so the app
+    doesn't crash — flag will just stay off until a score source exists.
+    """
     text = " ".join([
         str(market.get("subtitle", "")),
         str(market.get("yes_sub_title", "")),
@@ -168,7 +175,15 @@ def fetch_tennis_markets():
         for event in events:
             markets = event.get("markets") or client.list_markets(event_ticker=event.get("event_ticker"))
             for m in markets:
-                price_yes = m.get("yes_bid") or m.get("last_price")
+                # Kalshi returns prices as dollar-string fields like "0.5900",
+                # not integer cents under "yes_bid" as originally assumed.
+                price_yes = None
+                raw_price = m.get("yes_bid_dollars") or m.get("last_price_dollars")
+                if raw_price not in (None, ""):
+                    try:
+                        price_yes = round(float(raw_price) * 100)
+                    except (TypeError, ValueError):
+                        price_yes = None
                 if price_yes is None:
                     continue
                 score = extract_score(m)
