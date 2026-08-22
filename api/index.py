@@ -21,17 +21,9 @@ Kalshi requires auth for those too.
 import os
 import re
 import secrets
-import sys
 from functools import wraps
 
 from flask import Flask, jsonify, request, Response
-
-# Vercel's Python runtime doesn't always add this file's own directory to
-# sys.path, so a plain "from kalshi_client import ..." can fail with
-# ModuleNotFoundError even though the file sits right next to it. Force it
-# onto the path explicitly so the sibling-module import works regardless of
-# how the runtime invokes this file.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kalshi_client import KalshiClient
 
@@ -46,48 +38,23 @@ client = KalshiClient()
 
 WATCH_USER = os.environ.get("WATCH_USER", "")
 WATCH_PASS = os.environ.get("WATCH_PASS", "")
-# For multiple logins, set WATCH_USERS as comma-separated "user:pass" pairs,
-# e.g. "brian:hunter2,partner:otherpass". WATCH_USER/WATCH_PASS above still
-# work too (as one more pair) so existing single-login setups don't break.
-WATCH_USERS_RAW = os.environ.get("WATCH_USERS", "")
-
-
-def _load_credentials() -> dict:
-    creds = {}
-    if WATCH_USER and WATCH_PASS:
-        creds[WATCH_USER] = WATCH_PASS
-    for pair in WATCH_USERS_RAW.split(","):
-        pair = pair.strip()
-        if not pair or ":" not in pair:
-            continue
-        user, _, pw = pair.partition(":")
-        user, pw = user.strip(), pw.strip()
-        if user and pw:
-            creds[user] = pw
-    return creds
-
-
-CREDENTIALS = _load_credentials()
 
 
 def check_auth(username, password):
     # secrets.compare_digest avoids leaking timing info about the password
-    stored_pw = CREDENTIALS.get(username or "")
-    if stored_pw is None:
-        # still run compare_digest against something to avoid a timing
-        # difference between "unknown user" and "wrong password"
-        secrets.compare_digest(password or "", "")
-        return False
-    return secrets.compare_digest(password or "", stored_pw)
+    return (
+        secrets.compare_digest(username or "", WATCH_USER)
+        and secrets.compare_digest(password or "", WATCH_PASS)
+    )
 
 
 def require_auth(f):
     @wraps(f)
     def wrapped(*args, **kwargs):
-        if not CREDENTIALS:
+        if not (WATCH_USER and WATCH_PASS):
             # no credentials configured yet -> fail closed, don't run wide open
             return Response(
-                "Server not configured: set WATCH_USER/WATCH_PASS or WATCH_USERS env vars.",
+                "Server not configured: set WATCH_USER and WATCH_PASS env vars.",
                 401,
             )
         auth = request.authorization
@@ -190,41 +157,9 @@ def api_markets():
 @app.route("/debug/raw")
 @require_auth
 def debug_raw():
-    """
-    Full diagnostic dump: shows the raw events Kalshi returns BEFORE our
-    tennis filter is applied, so we can see actual category/title/series_ticker
-    values and figure out why a known-live match isn't matching.
-    """
     try:
-        events = client.list_events(status="open")
-        sample = []
-        for e in events[:15]:
-            sample.append({
-                "title": e.get("title"),
-                "category": e.get("category"),
-                "series_ticker": e.get("series_ticker"),
-                "event_ticker": e.get("event_ticker"),
-                "status": e.get("status"),
-            })
-        tennis_matches = [e for e in events if looks_like_tennis(e)]
-        return jsonify({
-            "total_events_returned": len(events),
-            "sample_of_first_15_events": sample,
-            "tennis_keyword_matches": len(tennis_matches),
-            "tennis_match_titles": [e.get("title") for e in tennis_matches[:10]],
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
-
-@app.route("/debug/market/<ticker>")
-@require_auth
-def debug_one_market(ticker):
-    """Fetch and dump one specific market's full raw payload by ticker,
-    for inspecting exact score field names on a known-live match."""
-    try:
-        data = client.get(f"/markets/{ticker}")
-        return jsonify(data)
+        _, raw_debug = fetch_tennis_markets()
+        return jsonify(raw_debug)
     except Exception as e:
         return jsonify({"error": str(e)})
 
