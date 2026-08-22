@@ -38,7 +38,18 @@ from kalshi_client import KalshiClient
 # ---- tune these ----
 PRICE_SKEW_THRESHOLD = 15   # cents from 50 to count as "lopsided"
 CLOSE_GAME_MARGIN = 1       # current-set game diff <= this counts as "close"
-TENNIS_KEYWORDS = ["tennis", "atp", "wta", "challenger"]
+TENNIS_KEYWORDS = ["tennis", "atp", "wta", "challenger"]  # kept for debug/series matching display
+# The keyword filter above is too broad on its own — it also catches annual
+# futures ("Men's Tournament Winner"), prop bets, doubles, etc. For the
+# actual live match-winner markets (the ones with real-time score + price),
+# Kalshi uses these specific series tickers:
+TENNIS_MATCH_SERIES = [
+    "KXATPMATCH",            # ATP Tennis Match (tour-level match winner)
+    "KXWTAMATCH",            # WTA Tennis Match (tour-level match winner)
+    "KXATPCHALLENGERMATCH",  # Challenger ATP match winner
+    "KXWTACHALLENGERMATCH",  # Challenger WTA match winner
+    "KXCHALLENGERMATCH",     # Challenger ATP (older/duplicate ticker)
+]
 # ---------------------
 
 app = Flask(__name__)
@@ -146,29 +157,18 @@ def compute_flag(price_yes_cents, score) -> bool:
 
 
 def fetch_tennis_markets():
-    # Query Sports-category series first (server-side filtered, so this is
-    # a manageable list) instead of paging through 13000+ unrelated events.
-    sports_series = client.list_series(category="Sports")
-    tennis_series_tickers = [
-        s.get("ticker") or s.get("series_ticker")
-        for s in sports_series
-        if any(
-            k in " ".join([str(s.get("title", "")), str(s.get("ticker", "") or s.get("series_ticker", ""))]).lower()
-            for k in TENNIS_KEYWORDS
-        )
-    ]
-
+    # Query only the specific series tickers known to be live match-winner
+    # markets (see TENNIS_MATCH_SERIES) instead of scanning by keyword,
+    # which also catches annual futures, props, and doubles markets that
+    # have no live score/price to flag on.
     processed = []
     raw_debug = []
-    for series_ticker in tennis_series_tickers:
+    for series_ticker in TENNIS_MATCH_SERIES:
         events = client.list_events(series_ticker=series_ticker, status="open")
         for event in events:
             markets = event.get("markets") or client.list_markets(event_ticker=event.get("event_ticker"))
             for m in markets:
                 price_yes = m.get("yes_bid") or m.get("last_price")
-                # Skip markets with no live trading price at all (e.g. annual
-                # futures like "Who will win a Grand Slam in 2026" that got
-                # swept in by the keyword match but aren't live matches).
                 if price_yes is None:
                     continue
                 score = extract_score(m)
@@ -236,26 +236,17 @@ def debug_raw():
 @app.route("/debug/series")
 @require_auth
 def debug_series():
-    """Diagnostic: list Sports-category series specifically (filtered
-    server-side via category=Sports, since the full unfiltered series list
-    has 13000+ entries) so we can find the actual tennis-related
-    series_tickers to query directly."""
+    """Diagnostic: check each whitelisted match-level series ticker for
+    live/open events right now, so we can confirm which ones are active."""
     try:
-        sports_series = client.list_series(category="Sports")
-        all_items = [{
-            "series_ticker": s.get("ticker") or s.get("series_ticker"),
-            "title": s.get("title"),
-            "category": s.get("category"),
-        } for s in sports_series]
-        tennis_series = [s for s in all_items if any(
-            k in " ".join([str(s.get("title", "")), str(s.get("series_ticker", ""))]).lower()
-            for k in TENNIS_KEYWORDS
-        )]
-        return jsonify({
-            "total_sports_series_returned": len(all_items),
-            "tennis_matches": tennis_series,
-            "all_sports_series": all_items,
-        })
+        results = {}
+        for series_ticker in TENNIS_MATCH_SERIES:
+            events = client.list_events(series_ticker=series_ticker, status="open")
+            results[series_ticker] = {
+                "open_event_count": len(events),
+                "sample_titles": [e.get("title") for e in events[:5]],
+            }
+        return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)})
 
