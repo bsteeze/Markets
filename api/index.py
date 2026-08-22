@@ -146,28 +146,39 @@ def compute_flag(price_yes_cents, score) -> bool:
 
 
 def fetch_tennis_markets():
-    events = client.list_events(status="open")
-    tennis_events = [e for e in events if looks_like_tennis(e)]
+    # Query Sports-category series first (server-side filtered, so this is
+    # a manageable list) instead of paging through 13000+ unrelated events.
+    sports_series = client.list_series(category="Sports")
+    tennis_series_tickers = [
+        s.get("ticker") or s.get("series_ticker")
+        for s in sports_series
+        if any(
+            k in " ".join([str(s.get("title", "")), str(s.get("ticker", "") or s.get("series_ticker", ""))]).lower()
+            for k in TENNIS_KEYWORDS
+        )
+    ]
 
     processed = []
     raw_debug = []
-    for event in tennis_events:
-        markets = event.get("markets") or client.list_markets(event_ticker=event.get("event_ticker"))
-        for m in markets:
-            price_yes = m.get("yes_bid") or m.get("last_price")
-            score = extract_score(m)
-            flagged = compute_flag(price_yes, score)
-            processed.append({
-                "event_title": event.get("title"),
-                "ticker": m.get("ticker"),
-                "yes_sub_title": m.get("yes_sub_title") or m.get("subtitle"),
-                "price_yes_cents": price_yes,
-                "score_raw": score,
-                "volume": m.get("volume"),
-                "flagged": flagged,
-            })
-            if len(raw_debug) < 5:
-                raw_debug.append(m)
+    for series_ticker in tennis_series_tickers:
+        events = client.list_events(series_ticker=series_ticker, status="open")
+        for event in events:
+            markets = event.get("markets") or client.list_markets(event_ticker=event.get("event_ticker"))
+            for m in markets:
+                price_yes = m.get("yes_bid") or m.get("last_price")
+                score = extract_score(m)
+                flagged = compute_flag(price_yes, score)
+                processed.append({
+                    "event_title": event.get("title"),
+                    "ticker": m.get("ticker"),
+                    "yes_sub_title": m.get("yes_sub_title") or m.get("subtitle"),
+                    "price_yes_cents": price_yes,
+                    "score_raw": score,
+                    "volume": m.get("volume"),
+                    "flagged": flagged,
+                })
+                if len(raw_debug) < 5:
+                    raw_debug.append(m)
     return processed, raw_debug
 
 
@@ -220,23 +231,25 @@ def debug_raw():
 @app.route("/debug/series")
 @require_auth
 def debug_series():
-    """Diagnostic: list series (much shorter than raw events) so we can
-    find the actual tennis-related series_tickers to query directly."""
+    """Diagnostic: list Sports-category series specifically (filtered
+    server-side via category=Sports, since the full unfiltered series list
+    has 13000+ entries) so we can find the actual tennis-related
+    series_tickers to query directly."""
     try:
-        all_series = client.list_series()
-        sample = [{
+        sports_series = client.list_series(category="Sports")
+        all_items = [{
             "series_ticker": s.get("ticker") or s.get("series_ticker"),
             "title": s.get("title"),
             "category": s.get("category"),
-        } for s in all_series[:40]]
-        tennis_series = [s for s in sample if any(
-            k in " ".join([str(s.get("title", "")), str(s.get("category", "")), str(s.get("series_ticker", ""))]).lower()
+        } for s in sports_series]
+        tennis_series = [s for s in all_items if any(
+            k in " ".join([str(s.get("title", "")), str(s.get("series_ticker", ""))]).lower()
             for k in TENNIS_KEYWORDS
         )]
         return jsonify({
-            "total_series_returned": len(all_series),
-            "sample_of_first_40": sample,
-            "tennis_matches_in_sample": tennis_series,
+            "total_sports_series_returned": len(all_items),
+            "tennis_matches": tennis_series,
+            "all_sports_series": all_items,
         })
     except Exception as e:
         return jsonify({"error": str(e)})
