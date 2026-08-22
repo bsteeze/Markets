@@ -251,6 +251,24 @@ def debug_series():
         return jsonify({"error": str(e)})
 
 
+@app.route("/debug/event/<series_ticker>")
+@require_auth
+def debug_one_event(series_ticker):
+    """Dump the FULL raw structure of the first open event for a given
+    series ticker, so we can see actual field names (event_ticker vs ticker,
+    whether 'markets' is nested, etc) instead of guessing."""
+    try:
+        events = client.list_events(series_ticker=series_ticker, status="open")
+        if not events:
+            return jsonify({"error": f"No open events found for {series_ticker}"})
+        return jsonify({
+            "event_count": len(events),
+            "first_event_full": events[0],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 @app.route("/debug/market/<ticker>")
 @require_auth
 def debug_one_market(ticker):
