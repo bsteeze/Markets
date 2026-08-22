@@ -166,6 +166,11 @@ def fetch_tennis_markets():
             markets = event.get("markets") or client.list_markets(event_ticker=event.get("event_ticker"))
             for m in markets:
                 price_yes = m.get("yes_bid") or m.get("last_price")
+                # Skip markets with no live trading price at all (e.g. annual
+                # futures like "Who will win a Grand Slam in 2026" that got
+                # swept in by the keyword match but aren't live matches).
+                if price_yes is None:
+                    continue
                 score = extract_score(m)
                 flagged = compute_flag(price_yes, score)
                 processed.append({
