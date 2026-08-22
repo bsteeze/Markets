@@ -31,9 +31,19 @@ class KalshiClient:
         self.key_id = KALSHI_KEY_ID
         self.private_key = None
         if KALSHI_PRIVATE_KEY_PEM:
-            self.private_key = serialization.load_pem_private_key(
-                KALSHI_PRIVATE_KEY_PEM.encode("utf-8"), password=None
-            )
+            try:
+                self.private_key = serialization.load_pem_private_key(
+                    KALSHI_PRIVATE_KEY_PEM.encode("utf-8"), password=None
+                )
+            except Exception as e:
+                # A malformed/incomplete key must NEVER crash the whole app.
+                # Fall back to unauthenticated requests (fine for public
+                # market-listing endpoints) and surface the problem via
+                # /api/markets' error field instead of a hard 500 at import time.
+                print(f"WARNING: could not load KALSHI_PRIVATE_KEY_PEM, "
+                      f"falling back to unauthenticated requests: {e}")
+                self.private_key = None
+                self.key_load_error = str(e)
 
     def _auth_headers(self, method: str, path: str) -> dict:
         if not (self.key_id and self.private_key):
@@ -72,3 +82,14 @@ class KalshiClient:
             params["event_ticker"] = event_ticker
         data = self.get("/markets", params=params)
         return data.get("markets", [])
+
+    def list_series(self, category: str = None) -> list:
+        """List series (tournament/market-family metadata) - a much shorter
+        list than raw events, so we can find tennis-related series_tickers
+        first, then fetch only THEIR events instead of paging through
+        thousands of unrelated events."""
+        params = {}
+        if category:
+            params["category"] = category
+        data = self.get("/series", params=params)
+        return data.get("series", data if isinstance(data, list) else [])
