@@ -50,6 +50,25 @@ TENNIS_MATCH_SERIES = [
     "KXWTACHALLENGERMATCH",  # Challenger WTA match winner
     "KXCHALLENGERMATCH",     # Challenger ATP (older/duplicate ticker)
 ]
+
+# Kalshi's real market page URL pattern is:
+#   https://kalshi.com/markets/{series_ticker_lower}/{display-slug}/{event_ticker_lower}
+# Confirmed via live pages for these two; the display-slug for the
+# Challenger tickers isn't confirmed, so those fall back to the series
+# landing page (https://kalshi.com/markets/{series_ticker_lower}), which
+# is a real working page even without the exact slug.
+KALSHI_SERIES_SLUG = {
+    "KXATPMATCH": "atp-tennis-match",
+    "KXWTAMATCH": "wta-tennis-match",
+}
+
+
+def kalshi_market_url(series_ticker: str, event_ticker: str) -> str:
+    series_lower = series_ticker.lower()
+    slug = KALSHI_SERIES_SLUG.get(series_ticker)
+    if slug and event_ticker:
+        return f"https://kalshi.com/markets/{series_lower}/{slug}/{event_ticker.lower()}"
+    return f"https://kalshi.com/markets/{series_lower}"
 # ---------------------
 
 app = Flask(__name__)
@@ -196,6 +215,7 @@ def fetch_tennis_markets():
                     "score_raw": score,
                     "volume": m.get("volume"),
                     "flagged": flagged,
+                    "kalshi_url": kalshi_market_url(series_ticker, event.get("event_ticker")),
                 })
                 if len(raw_debug) < 5:
                     raw_debug.append(m)
@@ -324,15 +344,64 @@ INDEX_HTML = """<!DOCTYPE html>
   .row { display:flex; justify-content:space-between; align-items:center;
     font-size:13px; color:var(--muted); }
   .price { font-size:18px; font-weight:700; color:var(--green); }
+  .kalshi-link { display:block; margin-top:10px; font-size:12px; color:var(--green);
+    text-decoration:none; font-weight:600; }
+  .kalshi-link:hover { text-decoration:underline; }
   .empty { color:var(--muted); text-align:center; padding:40px 0; }
+  .section-title { font-size:13px; font-weight:700; color:var(--muted);
+    text-transform:uppercase; letter-spacing:.06em; margin:20px 0 10px 0; }
+  .section-title:first-of-type { margin-top:0; }
+  .scalp-card { border-color:#3a3a10; background:#1c1c12; }
+  .scalp-rank { display:inline-block; background:#e8b923; color:#241d00; font-size:11px;
+    font-weight:800; padding:2px 7px; border-radius:20px; margin-right:6px; }
+  .scalp-range { color:#e8b923; font-weight:700; }
+  .hint { color:var(--muted); font-size:12px; margin-bottom:16px; line-height:1.4; }
 </style>
 </head>
 <body>
   <h1>🎾 Kalshi Tennis Watch</h1>
   <div class="status" id="status">Loading...</div>
   <div class="error" id="error"></div>
+
+  <div class="section-title">🎯 Best for Scalping</div>
+  <div class="hint">Ranked by how much the price has actually moved while this page has been open — bigger swings mean more two-way action to work, same as your live-scalp read on a choppy vs. smooth graph. Needs a few minutes of live data to populate.</div>
+  <div id="scalp-picks"></div>
+
+  <div class="section-title">All Live Markets</div>
   <div id="markets"></div>
+
 <script>
+// Client-side price history — this app has no database, so "choppy vs
+// smooth" volatility is tracked in-memory in the browser for as long as
+// this tab stays open. Resets on reload; needs a few poll cycles to be
+// meaningful (each poll is ~10s, so give it 2-3 minutes for a real read).
+let priceHistory = {}; // ticker -> [{t, price}]
+const HISTORY_WINDOW_MS = 6 * 60 * 1000; // keep last 6 minutes of ticks
+const MIN_TICKS_FOR_SCORE = 4;           // need at least this many polls before ranking
+
+function updateHistory(markets) {
+  const now = Date.now();
+  markets.forEach(m => {
+    if (m.price_yes_cents == null || !m.ticker) return;
+    if (!priceHistory[m.ticker]) priceHistory[m.ticker] = [];
+    const hist = priceHistory[m.ticker];
+    const last = hist[hist.length - 1];
+    if (!last || last.price !== m.price_yes_cents) {
+      hist.push({ t: now, price: m.price_yes_cents });
+    }
+    priceHistory[m.ticker] = hist.filter(p => now - p.t <= HISTORY_WINDOW_MS);
+  });
+}
+
+function scalpMetrics(ticker) {
+  const hist = priceHistory[ticker] || [];
+  if (hist.length < MIN_TICKS_FOR_SCORE) return null;
+  const prices = hist.map(p => p.price);
+  const range = Math.max(...prices) - Math.min(...prices);
+  const moves = hist.length - 1; // number of actual price changes seen
+  return { range, moves, ticks: hist.length };
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/markets');
@@ -340,12 +409,43 @@ async function refresh() {
     const statusEl = document.getElementById('status');
     const errorEl = document.getElementById('error');
     const container = document.getElementById('markets');
+    const scalpContainer = document.getElementById('scalp-picks');
+
     statusEl.textContent = `Updated ${new Date().toLocaleTimeString()} - ${data.markets.length} markets`;
     errorEl.textContent = data.error ? `Error: ${data.error}` : '';
+
     if (!data.markets || data.markets.length === 0) {
       container.innerHTML = '<div class="empty">No live tennis markets found right now.</div>';
+      scalpContainer.innerHTML = '';
       return;
     }
+
+    updateHistory(data.markets);
+
+    // ---- Best for Scalping section ----
+    const scored = data.markets
+      .map(m => ({ ...m, scalp: scalpMetrics(m.ticker) }))
+      .filter(m => m.scalp && m.scalp.range >= 2) // require some real movement
+      .sort((a, b) => b.scalp.range - a.scalp.range)
+      .slice(0, 5);
+
+    if (scored.length === 0) {
+      scalpContainer.innerHTML = '<div class="empty">Building price history — check back in a couple minutes once markets have ticked a few times.</div>';
+    } else {
+      scalpContainer.innerHTML = scored.map((m, i) => `
+        <div class="card scalp-card">
+          <div class="event-title">${m.event_title || ''}</div>
+          <div class="market-name"><span class="scalp-rank">#${i + 1}</span>${m.yes_sub_title || m.ticker || ''}</div>
+          <div class="row">
+            <span>Moved <span class="scalp-range">±${m.scalp.range}¢</span> over ${m.scalp.ticks} ticks</span>
+            <span class="price">${m.price_yes_cents ?? '-'}¢</span>
+          </div>
+          ${m.kalshi_url ? `<a href="${m.kalshi_url}" target="_blank" rel="noopener" class="kalshi-link">View on Kalshi &rarr;</a>` : ''}
+        </div>
+      `).join('');
+    }
+
+    // ---- Full list (existing behavior) ----
     const sorted = [...data.markets].sort((a, b) => (b.flagged - a.flagged));
     container.innerHTML = sorted.map(m => `
       <div class="card ${m.flagged ? 'flagged' : ''}">
@@ -356,6 +456,7 @@ async function refresh() {
           <span>Vol: ${m.volume ?? '-'}</span>
           <span class="price">${m.price_yes_cents ?? '-'}¢</span>
         </div>
+        ${m.kalshi_url ? `<a href="${m.kalshi_url}" target="_blank" rel="noopener" class="kalshi-link">View on Kalshi &rarr;</a>` : ''}
       </div>
     `).join('');
   } catch (e) {
