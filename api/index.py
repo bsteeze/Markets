@@ -723,7 +723,15 @@ async function refresh() {
     }
 
     // ---- Full list (existing behavior) ----
-    const sorted = [...data.markets].sort((a, b) => (b.underpriced_by_points - a.underpriced_by_points) || (b.flagged - a.flagged));
+    // Sort priority: underpriced-by-points signal first, then the
+    // close-score/skewed-price flag, then — importantly — live matches
+    // above pre-match ones regardless of flags, since a live match is
+    // always more relevant to you than one that hasn't started yet.
+    const sorted = [...data.markets].sort((a, b) =>
+      (b.underpriced_by_points - a.underpriced_by_points) ||
+      (b.flagged - a.flagged) ||
+      (b.is_live - a.is_live)
+    );
     container.innerHTML = sorted.map(m => `
       <div class="card ${m.flagged || m.underpriced_by_points ? 'flagged' : ''}">
         ${m.underpriced_by_points
@@ -749,4 +757,3 @@ setInterval(refresh, 10000);
 </body>
 </html>
 """
-
