@@ -34,6 +34,7 @@ from flask import Flask, jsonify, request, Response
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from kalshi_client import KalshiClient
+from sofascore_client import SofascoreClient
 
 # ---- tune these ----
 PRICE_SKEW_THRESHOLD = 15   # cents from 50 to count as "lopsided"
@@ -73,6 +74,7 @@ def kalshi_market_url(series_ticker: str, event_ticker: str) -> str:
 
 app = Flask(__name__)
 client = KalshiClient()
+sofa = SofascoreClient()
 
 WATCH_USER = os.environ.get("WATCH_USER", "")
 WATCH_PASS = os.environ.get("WATCH_PASS", "")
@@ -182,17 +184,187 @@ def compute_flag(price_yes_cents, score) -> bool:
     return False
 
 
+# ---- Point-win-% signal (via Sofascore) ----
+# Based on the well-established stat: winning 51% of total points in a
+# match correlates to roughly an 85% match-win probability; 52%+ pushes
+# that above 95%. If Kalshi's price hasn't caught up to that yet, that's
+# the "underpriced given points scored" signal you're after.
+POINT_PCT_UNDERPRICED_GAP = 15  # min gap between implied-by-points prob and Kalshi price to flag
+
+
+def implied_prob_from_point_pct(pct: float):
+    if pct is None:
+        return None
+    if pct >= 52:
+        return 95
+    if pct >= 51:
+        return 85
+    return None
+
+
+def event_surname_parts(event_title: str):
+    """'Nakashima vs Tiafoe' -> ('nakashima', 'tiafoe'). Returns (None, None)
+    if the title doesn't parse cleanly."""
+    if not event_title:
+        return None, None
+    parts = re.split(r"\s+vs\.?\s+", event_title, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return None, None
+    surname_a = parts[0].strip().lower().split()[-1] if parts[0].strip() else ""
+    surname_b = parts[1].strip().lower().split()[-1] if parts[1].strip() else ""
+    return surname_a, surname_b
+
+
+def find_sofascore_match(surname_a: str, surname_b: str, sofa_events: list):
+    """Search Sofascore's live tennis events for one whose home/away team
+    names contain these two surnames (in either order). Returns
+    {'event': <raw sofa event dict>, 'a_is_home': bool} or None."""
+    if not surname_a or not surname_b:
+        return None
+    for ev in sofa_events:
+        home = ((ev.get("homeTeam") or {}).get("name") or "").lower()
+        away = ((ev.get("awayTeam") or {}).get("name") or "").lower()
+        if surname_a in home and surname_b in away:
+            return {"event": ev, "a_is_home": True}
+        if surname_a in away and surname_b in home:
+            return {"event": ev, "a_is_home": False}
+    return None
+
+
+def parse_set_progress(sofa_event: dict):
+    """Pull sets won and current-set games from Sofascore's homeScore/
+    awayScore fields (periodN = games won in set N). Returns
+    {'sets_home': int, 'sets_away': int, 'current_set': int,
+     'games_home': int, 'games_away': int} or None if unparseable."""
+    try:
+        home_score = sofa_event.get("homeScore") or {}
+        away_score = sofa_event.get("awayScore") or {}
+        sets_home = home_score.get("current")
+        sets_away = away_score.get("current")
+        # Find the highest period number that has data on either side —
+        # that's the set currently being played (or just finished).
+        current_set = 0
+        games_home, games_away = 0, 0
+        for n in range(1, 6):  # tennis maxes out at 5 sets
+            key = f"period{n}"
+            h, a = home_score.get(key), away_score.get(key)
+            if h is not None or a is not None:
+                current_set = n
+                games_home, games_away = h or 0, a or 0
+        if sets_home is None or sets_away is None or current_set == 0:
+            return None
+        return {
+            "sets_home": sets_home, "sets_away": sets_away,
+            "current_set": current_set,
+            "games_home": games_home, "games_away": games_away,
+        }
+    except Exception:
+        return None
+
+
+def estimate_sets_remaining(sets_home: int, sets_away: int, best_of: int = 3):
+    """Max sets left if the match goes the distance for whichever side is
+    ahead. ASSUMES BEST-OF-3 by default — true for standard ATP/WTA tour
+    and Challenger matches, but WRONG for men's Grand Slam singles
+    (best-of-5). We don't have a reliable signal to distinguish these from
+    Kalshi/Sofascore data alone, so this is a known simplification —
+    treat the "time left" read with extra skepticism during Slams."""
+    sets_to_win = (best_of // 2) + 1
+    leader_sets = max(sets_home or 0, sets_away or 0)
+    return max(sets_to_win - leader_sets, 0)
+
+
+MIN_VOLUME_FOR_ENTRY = 500  # don't suggest entries on markets too thin to actually execute in
+
+
+def compute_opportunity(price_yes_cents, point_win_pct, volume, sets_remaining):
+    """Composite score: real edge (from points) x confidence x time-left x
+    liquidity gate. Returns (score, reasons_dict) — score is 0 if any gate
+    fails (not live, no edge, or too thin to trade)."""
+    implied = implied_prob_from_point_pct(point_win_pct)
+    if implied is None or price_yes_cents is None:
+        return 0, None
+    edge = implied - price_yes_cents
+    if edge <= 0:
+        return 0, None
+    if volume is None or volume < MIN_VOLUME_FOR_ENTRY:
+        return 0, None
+    if sets_remaining is None:
+        time_factor = 0.5  # unknown progress — don't fully zero it out, but don't reward it either
+    elif sets_remaining <= 0:
+        time_factor = 0.15  # match could end any point now — real edge, very little runway
+    else:
+        time_factor = min(sets_remaining / 2, 1.0)  # more sets left = more time to work the edge
+    score = round(edge * time_factor, 1)
+    return score, {"edge": edge, "time_factor": time_factor, "sets_remaining": sets_remaining}
+
+
+def augment_event_with_points(event_title: str, sofa_events: list):
+    """For one Kalshi event, try to find the matching live Sofascore match
+    and pull total points won per side + set progress. Returns a dict like
+    {'a_pct': 54.2, 'b_pct': 45.8, 'a_surname':..., 'b_surname':...,
+     'sets_remaining': 1} or None if no match / no data. Never raises —
+    this is a nice-to-have augmentation, not core functionality.
+    """
+    try:
+        surname_a, surname_b = event_surname_parts(event_title)
+        if not surname_a or not surname_b:
+            return None
+        match = find_sofascore_match(surname_a, surname_b, sofa_events)
+        if not match:
+            return None
+        points = sofa.get_points_won(match["event"].get("id"))
+        if not points:
+            return None
+        home, away = points.get("home"), points.get("away")
+        total = (home or 0) + (away or 0)
+        if total <= 0:
+            return None
+        a_points = home if match["a_is_home"] else away
+        b_points = away if match["a_is_home"] else home
+
+        progress = parse_set_progress(match["event"])
+        sets_remaining = None
+        if progress:
+            leader_sets_a = progress["sets_home"] if match["a_is_home"] else progress["sets_away"]
+            leader_sets_b = progress["sets_away"] if match["a_is_home"] else progress["sets_home"]
+            sets_remaining = estimate_sets_remaining(leader_sets_a, leader_sets_b)
+
+        return {
+            "a_pct": round(a_points / total * 100, 1),
+            "b_pct": round(b_points / total * 100, 1),
+            "a_surname": surname_a,
+            "b_surname": surname_b,
+            "sets_remaining": sets_remaining,
+        }
+    except Exception:
+        return None
+
+
 def fetch_tennis_markets():
     # Query only the specific series tickers known to be live match-winner
     # markets (see TENNIS_MATCH_SERIES) instead of scanning by keyword,
     # which also catches annual futures, props, and doubles markets that
     # have no live score/price to flag on.
+
+    # Fetch Sofascore's live tennis events ONCE per call (not once per
+    # Kalshi event) — this is the expensive/fragile call, so minimize it.
+    # If Sofascore is down/blocked, we just skip the points-based signal
+    # entirely rather than breaking the whole markets fetch.
+    try:
+        sofa_events = sofa.list_live_tennis_events()
+    except Exception:
+        sofa_events = []
+
     processed = []
     raw_debug = []
     for series_ticker in TENNIS_MATCH_SERIES:
         events = client.list_events(series_ticker=series_ticker, status="open")
         for event in events:
             markets = event.get("markets") or client.list_markets(event_ticker=event.get("event_ticker"))
+            event_title = event.get("title")
+            points_signal = augment_event_with_points(event_title, sofa_events)
+
             for m in markets:
                 # Kalshi returns prices as dollar-string fields like "0.5900",
                 # not integer cents under "yes_bid" as originally assumed.
@@ -207,8 +379,29 @@ def fetch_tennis_markets():
                     continue
                 score = extract_score(m)
                 flagged = compute_flag(price_yes, score)
+
+                point_win_pct = None
+                underpriced_by_points = False
+                sets_remaining = None
+                opportunity_score = 0
+                opportunity_detail = None
+                if points_signal:
+                    market_surname = (m.get("yes_sub_title") or m.get("subtitle") or "").strip().lower().split()
+                    market_surname = market_surname[-1] if market_surname else ""
+                    if market_surname == points_signal["a_surname"]:
+                        point_win_pct = points_signal["a_pct"]
+                    elif market_surname == points_signal["b_surname"]:
+                        point_win_pct = points_signal["b_pct"]
+                    implied = implied_prob_from_point_pct(point_win_pct)
+                    if implied is not None and (implied - price_yes) >= POINT_PCT_UNDERPRICED_GAP:
+                        underpriced_by_points = True
+                    sets_remaining = points_signal.get("sets_remaining")
+                    opportunity_score, opportunity_detail = compute_opportunity(
+                        price_yes, point_win_pct, m.get("volume"), sets_remaining
+                    )
+
                 processed.append({
-                    "event_title": event.get("title"),
+                    "event_title": event_title,
                     "ticker": m.get("ticker"),
                     "yes_sub_title": m.get("yes_sub_title") or m.get("subtitle"),
                     "price_yes_cents": price_yes,
@@ -216,10 +409,53 @@ def fetch_tennis_markets():
                     "volume": m.get("volume"),
                     "flagged": flagged,
                     "kalshi_url": kalshi_market_url(series_ticker, event.get("event_ticker")),
+                    "point_win_pct": point_win_pct,
+                    "underpriced_by_points": underpriced_by_points,
+                    "sets_remaining": sets_remaining,
+                    "opportunity_score": opportunity_score,
+                    "opportunity_detail": opportunity_detail,
+                    # True only if Sofascore confirms this match has actually
+                    # started (i.e. we got real points data for it) — NOT
+                    # just that Kalshi marked the market "open" for trading,
+                    # which happens well before the match actually begins.
+                    "is_live": points_signal is not None,
                 })
                 if len(raw_debug) < 5:
                     raw_debug.append(m)
     return processed, raw_debug
+
+
+@app.route("/debug/sofascore")
+@require_auth
+def debug_sofascore():
+    """Diagnostic: confirm Sofascore's unofficial API is reachable and show
+    the raw shape of a few live tennis events, so we can verify the
+    home/away team name fields match what our matching logic expects."""
+    try:
+        events = sofa.list_live_tennis_events()
+        sample = []
+        for ev in events[:10]:
+            sample.append({
+                "id": ev.get("id"),
+                "home": (ev.get("homeTeam") or {}).get("name"),
+                "away": (ev.get("awayTeam") or {}).get("name"),
+                "tournament": (ev.get("tournament") or {}).get("name"),
+            })
+        return jsonify({"total_live_events": len(events), "sample": sample})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/debug/points/<int:event_id>")
+@require_auth
+def debug_points(event_id):
+    """Diagnostic: dump the points-won stat for one specific Sofascore
+    event id (find the id via /debug/sofascore first)."""
+    try:
+        points = sofa.get_points_won(event_id)
+        return jsonify({"event_id": event_id, "points": points})
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
 @app.route("/")
@@ -338,6 +574,12 @@ INDEX_HTML = """<!DOCTYPE html>
   .card.flagged { border-color:var(--green); box-shadow:0 0 0 1px var(--green); }
   .flag-badge { position:absolute; top:12px; right:14px; background:var(--green);
     color:#06231a; font-size:11px; font-weight:700; padding:3px 8px; border-radius:20px; }
+  .points-badge { position:absolute; top:12px; right:14px; background:#e8b923;
+    color:#241d00; font-size:11px; font-weight:700; padding:3px 8px; border-radius:20px; }
+  .points-row { color:#e8b923; font-size:12px; margin-top:4px; }
+  .prematch-tag { display:inline-block; background:#3a3a3a; color:var(--muted);
+    font-size:10px; font-weight:700; padding:2px 6px; border-radius:10px; margin-left:6px;
+    text-transform:uppercase; letter-spacing:.03em; }
   .event-title { color:var(--muted); font-size:12px; text-transform:uppercase;
     letter-spacing:.04em; margin-bottom:4px; }
   .market-name { font-size:16px; font-weight:600; margin-bottom:8px; }
@@ -356,6 +598,11 @@ INDEX_HTML = """<!DOCTYPE html>
     font-weight:800; padding:2px 7px; border-radius:20px; margin-right:6px; }
   .scalp-range { color:#e8b923; font-weight:700; }
   .hint { color:var(--muted); font-size:12px; margin-bottom:16px; line-height:1.4; }
+  .entry-card { border-color:#0a3d24; background:#0f1f17; }
+  .entry-rank { display:inline-block; background:var(--green); color:#06231a; font-size:11px;
+    font-weight:800; padding:2px 7px; border-radius:20px; margin-right:6px; }
+  .entry-detail { color:var(--muted); font-size:12px; margin-top:4px; line-height:1.4; }
+  .entry-detail b { color:var(--green); }
 </style>
 </head>
 <body>
@@ -363,8 +610,12 @@ INDEX_HTML = """<!DOCTYPE html>
   <div class="status" id="status">Loading...</div>
   <div class="error" id="error"></div>
 
+  <div class="section-title">💰 Enter Now</div>
+  <div class="hint">Real edge (from live points won) × how much match is left to work it × enough volume to actually execute. Only shows live matches with a genuine mispricing — not just volatility. "Time left" assumes best-of-3 (wrong for men's Slam matches, which are best-of-5 — treat those with extra caution).</div>
+  <div id="entry-picks"></div>
+
   <div class="section-title">🎯 Best for Scalping</div>
-  <div class="hint">Ranked by how much the price has actually moved while this page has been open — bigger swings mean more two-way action to work, same as your live-scalp read on a choppy vs. smooth graph. Needs a few minutes of live data to populate.</div>
+  <div class="hint">Requires genuine back-and-forth reversals in the live price, not just a big range — a large one-directional move (price rushing toward 100 or 0) means the match is resolving, which is the worst time to enter, not the best. Needs a live match with real two-way price action to populate.</div>
   <div id="scalp-picks"></div>
 
   <div class="section-title">All Live Markets</div>
@@ -398,8 +649,24 @@ function scalpMetrics(ticker) {
   if (hist.length < MIN_TICKS_FOR_SCORE) return null;
   const prices = hist.map(p => p.price);
   const range = Math.max(...prices) - Math.min(...prices);
-  const moves = hist.length - 1; // number of actual price changes seen
-  return { range, moves, ticks: hist.length };
+
+  // Count direction reversals — a single one-directional run (e.g. price
+  // rushing toward 100 or 0 as the match resolves) has ZERO reversals
+  // despite a big range, and that's actually the WORST case to enter a
+  // scalp on: there's less two-way action left, not more. Genuine chop
+  // (price bouncing back and forth) has multiple reversals — that's the
+  // real signal, matching your "choppy vs smooth" read.
+  let reversals = 0;
+  for (let i = 1; i < prices.length - 1; i++) {
+    const diff1 = prices[i] - prices[i - 1];
+    const diff2 = prices[i + 1] - prices[i];
+    if (diff1 !== 0 && diff2 !== 0 && Math.sign(diff1) !== Math.sign(diff2)) {
+      reversals++;
+    }
+  }
+
+  const moves = hist.length - 1;
+  return { range, moves, ticks: hist.length, reversals };
 }
 
 async function refresh() {
@@ -423,21 +690,31 @@ async function refresh() {
     updateHistory(data.markets);
 
     // ---- Best for Scalping section ----
+    // Only rank matches confirmed LIVE by Sofascore (is_live=true) — Kalshi
+    // marks markets "open" well before a match actually starts, and thin
+    // pre-match order books can show fake "volatility" that's really just
+    // bid/ask noise on near-zero volume, not real live match action.
+    //
+    // Require at least 1 reversal — a big one-directional move (price
+    // running toward 100 or 0 as the match resolves) is the WORST case to
+    // enter on, not the best, even though it has a big range. Genuine
+    // chop is what you're after.
     const scored = data.markets
+      .filter(m => m.is_live)
       .map(m => ({ ...m, scalp: scalpMetrics(m.ticker) }))
-      .filter(m => m.scalp && m.scalp.range >= 2) // require some real movement
-      .sort((a, b) => b.scalp.range - a.scalp.range)
+      .filter(m => m.scalp && m.scalp.range >= 2 && m.scalp.reversals >= 1)
+      .sort((a, b) => (b.scalp.reversals - a.scalp.reversals) || (b.scalp.range - a.scalp.range))
       .slice(0, 5);
 
     if (scored.length === 0) {
-      scalpContainer.innerHTML = '<div class="empty">Building price history — check back in a couple minutes once markets have ticked a few times.</div>';
+      scalpContainer.innerHTML = '<div class="empty">No confirmed-live matches showing genuine back-and-forth chop yet — a big one-directional move doesn\'t count (that\'s trending toward resolution, not scalpable). Check back once a match is showing real two-way action.</div>';
     } else {
       scalpContainer.innerHTML = scored.map((m, i) => `
         <div class="card scalp-card">
           <div class="event-title">${m.event_title || ''}</div>
           <div class="market-name"><span class="scalp-rank">#${i + 1}</span>${m.yes_sub_title || m.ticker || ''}</div>
           <div class="row">
-            <span>Moved <span class="scalp-range">±${m.scalp.range}¢</span> over ${m.scalp.ticks} ticks</span>
+            <span>±${m.scalp.range}¢, ${m.scalp.reversals} reversal${m.scalp.reversals === 1 ? '' : 's'} / ${m.scalp.ticks} ticks</span>
             <span class="price">${m.price_yes_cents ?? '-'}¢</span>
           </div>
           ${m.kalshi_url ? `<a href="${m.kalshi_url}" target="_blank" rel="noopener" class="kalshi-link">View on Kalshi &rarr;</a>` : ''}
@@ -446,16 +723,19 @@ async function refresh() {
     }
 
     // ---- Full list (existing behavior) ----
-    const sorted = [...data.markets].sort((a, b) => (b.flagged - a.flagged));
+    const sorted = [...data.markets].sort((a, b) => (b.underpriced_by_points - a.underpriced_by_points) || (b.flagged - a.flagged));
     container.innerHTML = sorted.map(m => `
-      <div class="card ${m.flagged ? 'flagged' : ''}">
-        ${m.flagged ? '<div class="flag-badge">CLOSE SCORE / SKEWED PRICE</div>' : ''}
-        <div class="event-title">${m.event_title || ''}</div>
+      <div class="card ${m.flagged || m.underpriced_by_points ? 'flagged' : ''}">
+        ${m.underpriced_by_points
+          ? '<div class="points-badge">UNDERPRICED (POINTS)</div>'
+          : (m.flagged ? '<div class="flag-badge">CLOSE SCORE / SKEWED PRICE</div>' : '')}
+        <div class="event-title">${m.event_title || ''}${!m.is_live ? '<span class="prematch-tag">Pre-match</span>' : ''}</div>
         <div class="market-name">${m.yes_sub_title || m.ticker || ''}</div>
         <div class="row">
           <span>Vol: ${m.volume ?? '-'}</span>
           <span class="price">${m.price_yes_cents ?? '-'}¢</span>
         </div>
+        ${m.point_win_pct != null ? `<div class="points-row">Points won: ${m.point_win_pct}%</div>` : ''}
         ${m.kalshi_url ? `<a href="${m.kalshi_url}" target="_blank" rel="noopener" class="kalshi-link">View on Kalshi &rarr;</a>` : ''}
       </div>
     `).join('');
