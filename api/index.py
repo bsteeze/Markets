@@ -707,7 +707,7 @@ async function refresh() {
       .slice(0, 5);
 
     if (scored.length === 0) {
-      scalpContainer.innerHTML = '<div class="empty">No confirmed-live matches showing genuine back-and-forth chop yet — a big one-directional move doesn\'t count (that\'s trending toward resolution, not scalpable). Check back once a match is showing real two-way action.</div>';
+      scalpContainer.innerHTML = '<div class="empty">No confirmed-live matches showing genuine back-and-forth chop yet — a big one-directional move does not count (that is trending toward resolution, not scalpable). Check back once a match is showing real two-way action.</div>';
     } else {
       scalpContainer.innerHTML = scored.map((m, i) => `
         <div class="card scalp-card">
