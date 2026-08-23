@@ -50,7 +50,16 @@ TENNIS_MATCH_SERIES = [
     "KXATPCHALLENGERMATCH",  # Challenger ATP match winner
     "KXWTACHALLENGERMATCH",  # Challenger WTA match winner
     "KXCHALLENGERMATCH",     # Challenger ATP (older/duplicate ticker)
+    "KXITFMATCH",            # ITF Men's Match (lower-tier singles, e.g. M25 events)
+    "KXITFWMATCH",           # ITF Women's Match (lower-tier singles)
 ]
+# NOTE: doubles matches (KXATPDOUBLES, KXWTADOUBLES, KXITFDOUBLES) are
+# intentionally NOT included. Even if we pulled them in, our surname
+# matching against Sofascore only handles "Player A vs Player B" (two
+# names) — doubles events are "PlayerA/PlayerB vs PlayerC/PlayerD" and
+# would silently fail to match, so they'd show up with no point-win-%
+# data anyway. Adding real doubles support would need separate matching
+# logic for pairs.
 
 # Kalshi's real market page URL pattern is:
 #   https://kalshi.com/markets/{series_ticker_lower}/{display-slug}/{event_ticker_lower}
@@ -757,4 +766,3 @@ setInterval(refresh, 10000);
 </body>
 </html>
 """
-
