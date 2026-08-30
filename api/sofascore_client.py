@@ -10,6 +10,21 @@ community. Known risks, going in with eyes open:
   - Likely against Sofascore's ToS for automated/programmatic access,
     even though the underlying data is publicly viewable on their site
 
+CONFIRMED (2026-08-30): Cloudflare is serving a "challenge" response
+(403) when this is called from Vercel's serverless IP ranges — the
+requests are being flagged as automated traffic, not from a real
+browser. The headers below are a best-effort attempt to mimic a real
+browser request originating from sofascore.com itself (proper
+Referer/Origin/sec-fetch-* headers), which sometimes helps with
+Cloudflare's traffic-pattern matching. This is NOT guaranteed to work —
+a genuine JS-based Cloudflare challenge generally can't be solved by a
+plain server-side HTTP request no matter what headers are sent, since
+it requires executing a browser challenge script. If this still 403s
+after this change, the honest conclusion is that this free data source
+is not viable from this hosting environment, and a paid API (or a
+different hosting approach that isn't flagged as a datacenter IP) would
+be needed instead.
+
 Used here for one specific purpose: pulling the "Points won" stat
 (raw total points won per player so far in the match) to compute the
 point-win-% signal, since Kalshi's own market data has no such field.
@@ -26,7 +41,15 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    # Mimic a request originating from Sofascore's own web app, since
+    # that's the traffic pattern Cloudflare is least likely to challenge.
+    "Referer": "https://www.sofascore.com/",
+    "Origin": "https://www.sofascore.com",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "sec-fetch-dest": "empty",
 }
 TIMEOUT = 8
 
