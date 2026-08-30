@@ -418,6 +418,23 @@ def fetch_tennis_markets():
                         price_yes = None
                 if price_yes is None:
                     continue
+
+                # Same field-name mismatch as price: the real field is
+                # "volume_fp" (a float-string), not "volume" (which doesn't
+                # exist on the payload at all — confirmed via a live
+                # example where Kalshi's own page showed "$22,326 vol" while
+                # our old code read None every time). This silently broke
+                # both the on-card volume display AND the MIN_VOLUME_FOR_ENTRY
+                # liquidity gate in compute_opportunity, independent of the
+                # Sofascore issue.
+                volume = None
+                raw_volume = m.get("volume_fp")
+                if raw_volume not in (None, ""):
+                    try:
+                        volume = round(float(raw_volume))
+                    except (TypeError, ValueError):
+                        volume = None
+
                 score = extract_score(m)
                 flagged = compute_flag(price_yes, score)
                 started = market_has_started(m)
@@ -439,7 +456,7 @@ def fetch_tennis_markets():
                         underpriced_by_points = True
                     sets_remaining = points_signal.get("sets_remaining")
                     opportunity_score, opportunity_detail = compute_opportunity(
-                        price_yes, point_win_pct, m.get("volume"), sets_remaining
+                        price_yes, point_win_pct, volume, sets_remaining
                     )
 
                 processed.append({
@@ -448,7 +465,7 @@ def fetch_tennis_markets():
                     "yes_sub_title": m.get("yes_sub_title") or m.get("subtitle"),
                     "price_yes_cents": price_yes,
                     "score_raw": score,
-                    "volume": m.get("volume"),
+                    "volume": volume,
                     "flagged": flagged,
                     "kalshi_url": kalshi_market_url(series_ticker, event.get("event_ticker")),
                     "point_win_pct": point_win_pct,
