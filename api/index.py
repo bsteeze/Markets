@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import sys
+from datetime import datetime, timezone
 from functools import wraps
 
 from flask import Flask, jsonify, request, Response
@@ -176,6 +177,37 @@ def extract_score(market: dict):
     if m:
         return {"raw_match": m}
     return None
+
+
+def market_has_started(market: dict):
+    """Determine if a match has actually started, using ONLY Kalshi's own
+    data — independent of Sofascore entirely, so live/pre-match detection
+    keeps working even if Sofascore is blocked (as it currently is,
+    confirmed via /debug/sofascore returning a Cloudflare 403 challenge).
+
+    Kalshi's market payload includes 'occurrence_datetime', the scheduled
+    match time — separate from 'expiration_time' (the outside deadline the
+    market can resolve by, often days later). If that scheduled time has
+    passed, treat the match as started. This is a real signal from Kalshi
+    itself, not a guess — but it IS only the scheduled start time, so a
+    delayed match (running behind due to a previous match on court) will
+    read as "started" a little before it actually begins. Good enough for
+    "is this probably live" without needing a second data source at all.
+
+    Returns True/False, or None if the field is missing/unparseable
+    (treated as "unknown" rather than guessed either way).
+    """
+    raw = market.get("occurrence_datetime")
+    if not raw:
+        return None
+    try:
+        # Python's fromisoformat doesn't accept a trailing 'Z' before 3.11;
+        # normalize it to an explicit UTC offset for reliability.
+        iso = raw.replace("Z", "+00:00")
+        scheduled = datetime.fromisoformat(iso)
+        return datetime.now(timezone.utc) >= scheduled
+    except Exception:
+        return None
 
 
 def compute_flag(price_yes_cents, score) -> bool:
@@ -388,6 +420,7 @@ def fetch_tennis_markets():
                     continue
                 score = extract_score(m)
                 flagged = compute_flag(price_yes, score)
+                started = market_has_started(m)
 
                 point_win_pct = None
                 underpriced_by_points = False
@@ -423,11 +456,17 @@ def fetch_tennis_markets():
                     "sets_remaining": sets_remaining,
                     "opportunity_score": opportunity_score,
                     "opportunity_detail": opportunity_detail,
-                    # True only if Sofascore confirms this match has actually
-                    # started (i.e. we got real points data for it) — NOT
-                    # just that Kalshi marked the market "open" for trading,
-                    # which happens well before the match actually begins.
-                    "is_live": points_signal is not None,
+                    # PRIMARY live signal — from Kalshi's own scheduled-time
+                    # field, works with or without Sofascore. None (unknown)
+                    # is treated as "not confirmed live" for display purposes,
+                    # same as False, but kept distinct in the data.
+                    "is_live": bool(started),
+                    # SEPARATE enrichment flag — whether Sofascore actually
+                    # gave us point-win data for this match. This can be
+                    # False even on a genuinely live match (e.g. right now,
+                    # with Sofascore blocked) without mislabeling the match
+                    # as pre-match — that's the whole point of the split.
+                    "has_points_data": points_signal is not None,
                 })
                 if len(raw_debug) < 5:
                     raw_debug.append(m)
@@ -698,11 +737,44 @@ async function refresh() {
 
     updateHistory(data.markets);
 
+    // ---- Enter Now section ----
+    // Uses opportunity_score, computed server-side from real edge (live
+    // points won vs Kalshi price) x time-left x liquidity. This is
+    // separate from is_live — it additionally needs has_points_data=true
+    // (i.e. Sofascore actually returned points for this match), so this
+    // section can legitimately stay empty even while matches ARE live,
+    // if Sofascore itself is unreachable. Check /debug/sofascore if this
+    // never populates during a known-live match.
+    const entryContainer = document.getElementById('entry-picks');
+    const entryPicks = data.markets
+      .filter(m => m.opportunity_score > 0)
+      .sort((a, b) => b.opportunity_score - a.opportunity_score)
+      .slice(0, 5);
+
+    const anyPointsDataAtAll = data.markets.some(m => m.has_points_data);
+    if (entryPicks.length === 0) {
+      entryContainer.innerHTML = anyPointsDataAtAll
+        ? '<div class="empty">No live matches showing a big enough mispricing right now.</div>'
+        : '<div class="empty">No points data available right now (the live-stats source may be temporarily unreachable) — this section needs that data specifically, separate from the rest of the dashboard.</div>';
+    } else {
+      entryContainer.innerHTML = entryPicks.map((m, i) => `
+        <div class="card entry-card">
+          <div class="event-title">${m.event_title || ''}</div>
+          <div class="market-name"><span class="entry-rank">#${i + 1}</span>${m.yes_sub_title || m.ticker || ''}</div>
+          <div class="row">
+            <span>Points won: ${m.point_win_pct}%</span>
+            <span class="price">${m.price_yes_cents ?? '-'}¢</span>
+          </div>
+          <div class="entry-detail">Edge: <b>${m.opportunity_detail ? m.opportunity_detail.edge.toFixed(0) : '-'}¢</b> · Sets left (est., best-of-3): ${m.sets_remaining ?? '?'} · Vol: ${m.volume ?? '-'}</div>
+          ${m.kalshi_url ? `<a href="${m.kalshi_url}" target="_blank" rel="noopener" class="kalshi-link">View on Kalshi &rarr;</a>` : ''}
+        </div>
+      `).join('');
+    }
+
     // ---- Best for Scalping section ----
-    // Only rank matches confirmed LIVE by Sofascore (is_live=true) — Kalshi
-    // marks markets "open" well before a match actually starts, and thin
-    // pre-match order books can show fake "volatility" that's really just
-    // bid/ask noise on near-zero volume, not real live match action.
+    // Uses is_live, which comes from KALSHI'S OWN scheduled-time data —
+    // independent of Sofascore, so this works even if Sofascore is down
+    // (as it currently is — see /debug/sofascore for status).
     //
     // Require at least 1 reversal — a big one-directional move (price
     // running toward 100 or 0 as the match resolves) is the WORST case to
@@ -766,4 +838,3 @@ setInterval(refresh, 10000);
 </body>
 </html>
 """
-
